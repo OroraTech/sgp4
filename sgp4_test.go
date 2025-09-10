@@ -2,6 +2,7 @@ package sgp4
 
 import (
 	"errors"
+	"fmt"
 	"math"
 	"testing"
 	"time"
@@ -290,5 +291,103 @@ func TestNonDecayAtEpoch(t *testing.T) {
 			// Other errors at tsince=0 are still problems but not decay specific.
 			t.Errorf("Standard ISS TLE at tsince=0.0 reported unexpected error: %v", err)
 		}
+	}
+}
+
+// TestGeneratePasses_Reference validates pass prediction logic against a known
+// output from the reference C++ implementation.
+func TestGeneratePasses_Reference(t *testing.T) {
+	// TLE from the C++ reference output
+	issTLEStr := `1 25544U 98067A   25247.10182809  .00011777  00000-0  21333-3 0  9997
+2 25544  51.6327 275.9345 0004179 299.5263  60.5309 15.50088696528307`
+
+	tle, err := ParseTLE(issTLEStr)
+	if err != nil {
+		t.Fatalf("Failed to parse TLE: %v", err)
+	}
+
+	// Observer location (Montreal, consistent with previous examples generating similar passes)
+	obsLat := 45.51
+	obsLon := -73.59
+	obsAltMeters := 60.0
+
+	// Time window from the C++ reference output
+	startTime, err := time.Parse(time.RFC3339Nano, "2025-09-10T23:09:17.258527Z")
+	if err != nil {
+		t.Fatalf("Failed to parse start time: %v", err)
+	}
+	stopTime := startTime.Add(48 * time.Hour)
+
+	// Expected pass data from the C++ reference output
+	type ExpectedPass struct {
+		AOS   time.Time
+		LOS   time.Time
+		MaxEl float64
+	}
+
+	parseTime := func(s string) time.Time {
+		tm, pErr := time.Parse("2006-01-02 15:04:05.000000 MST", s)
+		if pErr != nil {
+			t.Fatalf("Failed to parse expected time '%s': %v", s, pErr)
+		}
+		return tm
+	}
+
+	expectedPasses := []ExpectedPass{
+		{AOS: parseTime("2025-09-11 00:09:00.000000 UTC"), LOS: parseTime("2025-09-11 00:19:26.000000 UTC"), MaxEl: 30.1},
+		{AOS: parseTime("2025-09-11 01:45:24.000000 UTC"), LOS: parseTime("2025-09-11 01:56:15.000000 UTC"), MaxEl: 50.7},
+		{AOS: parseTime("2025-09-11 03:22:47.000000 UTC"), LOS: parseTime("2025-09-11 03:33:17.000000 UTC"), MaxEl: 27.4},
+		{AOS: parseTime("2025-09-11 04:59:54.000000 UTC"), LOS: parseTime("2025-09-11 05:10:42.000000 UTC"), MaxEl: 41.7},
+		{AOS: parseTime("2025-09-11 06:36:42.000000 UTC"), LOS: parseTime("2025-09-11 06:47:24.000000 UTC"), MaxEl: 42.0},
+		{AOS: parseTime("2025-09-11 08:14:29.000000 UTC"), LOS: parseTime("2025-09-11 08:21:33.000000 UTC"), MaxEl: 5.5},
+		{AOS: parseTime("2025-09-11 23:20:49.000000 UTC"), LOS: parseTime("2025-09-11 23:30:39.000000 UTC"), MaxEl: 18.9},
+		{AOS: parseTime("2025-09-12 00:56:42.000000 UTC"), LOS: parseTime("2025-09-12 01:07:36.000000 UTC"), MaxEl: 73.0},
+		{AOS: parseTime("2025-09-12 02:33:58.000000 UTC"), LOS: parseTime("2025-09-12 02:44:31.000000 UTC"), MaxEl: 28.9},
+		{AOS: parseTime("2025-09-12 04:11:13.000000 UTC"), LOS: parseTime("2025-09-12 04:21:53.000000 UTC"), MaxEl: 33.7},
+		{AOS: parseTime("2025-09-12 05:48:02.000000 UTC"), LOS: parseTime("2025-09-12 05:58:55.000000 UTC"), MaxEl: 68.8},
+		{AOS: parseTime("2025-09-12 07:25:17.000000 UTC"), LOS: parseTime("2025-09-12 07:34:01.000000 UTC"), MaxEl: 10.7},
+		{AOS: parseTime("2025-09-12 22:32:51.000000 UTC"), LOS: parseTime("2025-09-12 22:41:44.000000 UTC"), MaxEl: 11.5},
+	}
+
+	// Run the pass prediction. A coarse step of 60 seconds is a good balance.
+	const stepSeconds = 60
+	predictedPasses, err := tle.GeneratePasses(obsLat, obsLon, obsAltMeters, startTime, stopTime, stepSeconds)
+	if err != nil {
+		t.Fatalf("GeneratePasses failed: %v", err)
+	}
+
+	// Compare results
+	if len(predictedPasses) != len(expectedPasses) {
+		t.Errorf("Mismatch in number of passes: got %d, want %d", len(predictedPasses), len(expectedPasses))
+		t.Logf("Got passes:")
+		for _, p := range predictedPasses {
+			t.Logf("  AOS: %v, LOS: %v, MaxEl: %.1f", p.AOS, p.LOS, p.MaxElevation)
+		}
+		t.Logf("Want passes:")
+		for _, p := range expectedPasses {
+			t.Logf("  AOS: %v, LOS: %v, MaxEl: %.1f", p.AOS, p.LOS, p.MaxEl)
+		}
+		t.FailNow()
+	}
+
+	const timeTolerance = time.Second * 2 // Allow ±1s difference
+	const elTolerance = 0.15              // Allow ±0.15 deg difference
+
+	for i, got := range predictedPasses {
+		want := expectedPasses[i]
+		t.Run(fmt.Sprintf("Pass_%d", i+1), func(t *testing.T) {
+			// Check AOS
+			if got.AOS.Sub(want.AOS).Abs() > timeTolerance {
+				t.Errorf("AOS mismatch:\n  got: %v\n want: %v\n diff: %v", got.AOS, want.AOS, got.AOS.Sub(want.AOS))
+			}
+			// Check LOS
+			if got.LOS.Sub(want.LOS).Abs() > timeTolerance {
+				t.Errorf("LOS mismatch:\n  got: %v\n want: %v\n diff: %v", got.LOS, want.LOS, got.LOS.Sub(want.LOS))
+			}
+			// Check Max Elevation
+			if math.Abs(got.MaxElevation-want.MaxEl) > elTolerance {
+				t.Errorf("MaxElevation mismatch: got %.2f, want %.2f", got.MaxElevation, want.MaxEl)
+			}
+		})
 	}
 }

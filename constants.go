@@ -14,7 +14,8 @@ const (
 	xj4           = -0.00000165597 // J4 harmonic (kXJ4)
 	torad         = math.Pi / 180.0
 	minutesPerDay = 1440.0
-	we            = 7.2921150e-5 // Earth's angular velocity (rad/sec) - Not directly kOMEGA_E
+	//	we            = 7.2921150e-5 // Earth's angular velocity (rad/sec) - Not directly kOMEGA_E
+	we = 1.00273790934
 	// kOMEGA_E from libsgp4 is earth rotation per sidereal day (1.00273790934)
 	// we seems to be omega_earth in rad/sec. SGP4 uses its own set of time/rotation constants.
 
@@ -33,13 +34,15 @@ const (
 
 // Computed values (non-constants) - these are based on SGP4's specific constants like xkmper
 var (
-	xke = 60.0 / math.Sqrt(xkmper*xkmper*xkmper/398600.8) // sqrt(GM_sgp4_units/R_sgp4_units^3)
+	//xke = 60.0 / math.Sqrt(xkmper*xkmper*xkmper/398600.8) // sqrt(GM_sgp4_units/R_sgp4_units^3)
+	xke = 0.0743669161331734132
 	// libsgp4 kMU = 398600.8, kXKMPER = 6378.135
-	ck2    = 0.5 * xj2 * ae * ae                // kCK2
-	ck4    = -0.375 * xj4 * ae * ae * ae * ae   // kCK4
-	qoms2t = math.Pow((120.0-78.0)/xkmper, 4.0) // kQOMS2T, based on kQ0=120, kS0=78
-	s      = ae * (1.0 + 78.0/xkmper)           // kS, based on kS0=78
-	a3ovk2 = -xj3 / ck2                         // kA3OVK2 is -kXJ3 / kCK2 * kAE^3, but since ae=1, this matches if xj3 is scaled by ae^3.
+	ck2 = 0.5 * xj2 * ae * ae              // kCK2
+	ck4 = -0.375 * xj4 * ae * ae * ae * ae // kCK4
+	//qoms2t = math.Pow((120.0-78.0)/xkmper, 4.0) // kQOMS2T, based on kQ0=120, kS0=78
+	qoms2t = 1.880279159015270643865e-9
+	s      = ae * (1.0 + 78.0/xkmper) // kS, based on kS0=78
+	a3ovk2 = -xj3 / ck2               // kA3OVK2 is -kXJ3 / kCK2 * kAE^3, but since ae=1, this matches if xj3 is scaled by ae^3.
 	// libsgp4 kA3OVK2 = -kXJ3 / kCK2 * kAE * kAE * kAE. Your xj3 is already a non-dim harmonic.
 	// So a3ovk2 = -xj3 / (0.5 * xj2 * ae*ae) * ae * ae * ae = -xj3 / (0.5 * xj2) * ae
 	// If xj3 in constants.go is truly dimensionless kXJ3, then a3ovk2 = -xj3 / (0.5*xj2). My original code had this right.

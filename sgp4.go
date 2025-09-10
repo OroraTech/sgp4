@@ -19,6 +19,7 @@ type Vector struct {
 }
 
 // ToGeodetic converts ECI coordinates to geodetic coordinates (lat, lon, alt)
+// ToGeodetic converts ECI coordinates to geodetic coordinates (lat, lon, alt)
 func (eci *Eci) ToGeodetic() (lat, lon, alt float64) {
 	currentRe := reSGP4 // Use SGP4-aligned constants
 	currentF := fSGP4
@@ -32,7 +33,7 @@ func (eci *Eci) ToGeodetic() (lat, lon, alt float64) {
 	lon = math.Atan2(y, x) - gmst
 	lon = wrapLongitude(lon)
 	r := math.Sqrt(x*x + y*y)
-	lat = math.Atan2(z, r)
+	lat = AcTan(z, r)
 
 	const maxIter = 10
 	const tol = 1e-10
@@ -47,7 +48,7 @@ func (eci *Eci) ToGeodetic() (lat, lon, alt float64) {
 		} else {
 			c_iter = 1.0 / math.Sqrt(1.0-e2*sinLat*sinLat)
 		}
-		lat = math.Atan2(z+currentRe*c_iter*e2*sinLat, r)
+		lat = AcTan(z+currentRe*c_iter*e2*sinLat, r)
 		if math.Abs(lat-oldLat) < tol {
 			break
 		}
@@ -171,20 +172,26 @@ func (tle *TLE) FindPosition(tsince float64) (Eci, error) {
 	for i := range 10 {
 		sinepw = math.Sin(epw)
 		cosepw = math.Cos(epw)
-		ecose = axn*cosepw + ayn_lpp*sinepw // e_k cos(E_k_ecc)
-		esine = axn*sinepw - ayn_lpp*cosepw // e_k sin(E_k_ecc)
-		f_kepler := capu - epw + esine      // Kepler's eq: M' - E_k_ecc + e_k sin(E_k_ecc) = 0
+		ecose = axn*cosepw + ayn_lpp*sinepw
+		esine = axn*sinepw - ayn_lpp*cosepw
+
+		f_kepler := capu - epw + esine
 		if math.Abs(f_kepler) < 1.0e-12 {
 			break
 		}
-		fdot_kepler := 1.0 - ecose // d(Kepler)/d(E_k_ecc)
+
+		fdot_kepler := 1.0 - ecose
 		delta_epw := f_kepler / fdot_kepler
+
 		if i == 0 { // First iteration, apply cap
 			if delta_epw > max_newton_raphson {
 				delta_epw = max_newton_raphson
 			} else if delta_epw < -max_newton_raphson {
 				delta_epw = -max_newton_raphson
 			}
+		} else {
+			// Second-order Newton-Raphson correction (matches libsgp4)
+			delta_epw = f_kepler / (fdot_kepler + 0.5*esine*delta_epw)
 		}
 		epw += delta_epw
 	}
@@ -331,123 +338,299 @@ func (tle *TLE) GeneratePasses(obsLat, obsLng, obsAltMeters float64, start, stop
 
 	var passes []PassDetails
 	var currentPass *PassDetails
-	var prevObservation *Observation
 
-	stepDuration := time.Duration(stepSeconds) * time.Second
-	currentTime := start
-
-	for !currentTime.After(stop) {
-		tsince := currentTime.Sub(tle.EpochTime()).Minutes()
-
+	// Create a wrapper function to get elevation for binary search
+	getElevationAtTime := func(t time.Time) (float64, error) {
+		tsince := t.Sub(tle.EpochTime()).Minutes()
 		eciState, err := tle.FindPosition(tsince)
 		if err != nil {
-			// If a propagation error occurs (e.g. decay or model breakdown),
-			// end any current pass and skip this step.
-			// fmt.Printf("Warning: Could not propagate for time %v: %v\n", currentTime, err)
-			if currentPass != nil { // Finalize pass if it was ongoing and propagation fails
-				// Use previous observation for LOS if possible
-				if prevObservation != nil {
-					currentPass.LOS = prevObservation.SatellitePos.Timestamp
-					currentPass.LOSAzimuth = prevObservation.LookAngles.Azimuth
-					currentPass.LOSObservation = *prevObservation
-				} else { // Fallback if no previous point (pass started and ended at this error point)
-					currentPass.LOS = currentTime // Approximate LOS time
-					// LOS Azimuth and Observation might be inaccurate or unavailable here.
-					// Use AOS details if nothing else.
-					currentPass.LOSAzimuth = currentPass.AOSAzimuth
-					currentPass.LOSObservation = currentPass.AOSObservation
-				}
-				currentPass.Duration = currentPass.LOS.Sub(currentPass.AOS)
-				passes = append(passes, *currentPass)
-				currentPass = nil
-			}
-			currentTime = currentTime.Add(stepDuration)
-			prevObservation = nil // Reset prevObservation due to error
-			continue
+			return 0.0, err
 		}
-
 		sv := &StateVector{
 			X: eciState.Position.X, Y: eciState.Position.Y, Z: eciState.Position.Z,
 			VX: eciState.Velocity.X, VY: eciState.Velocity.Y, VZ: eciState.Velocity.Z,
 		}
-
-		currentObservation, err := sv.GetLookAngle(observer, currentTime)
+		observation, err := sv.GetLookAngle(observer, t)
 		if err != nil {
-			// fmt.Printf("Warning: Could not get look angle for time %v: %v\n", currentTime, err)
-			currentTime = currentTime.Add(stepDuration)
-			prevObservation = nil
+			return 0.0, err
+		}
+		return observation.LookAngles.Elevation, nil
+	}
+
+	// findCrossingPoint finds the exact second the satellite crosses the horizon (0° elevation)
+	// between time1 and time2. `findingAOS` should be true for AOS, false for LOS.
+	findCrossingPoint := func(time1, time2 time.Time, findingAOS bool) (time.Time, error) {
+		running := true
+		cnt := 0
+		middleTime := time1
+
+		// Binary search for crossing point
+		for running && cnt < 16 { // Limit iterations
+			cnt++
+			duration := time2.Sub(time1)
+			middleTime = time1.Add(duration / 2)
+
+			elevation, err := getElevationAtTime(middleTime)
+			if err != nil {
+				return time1, err // Return start time on error
+			}
+
+			if elevation > 0.0 {
+				// Satellite is above horizon
+				if findingAOS {
+					time2 = middleTime
+				} else {
+					time1 = middleTime
+				}
+			} else {
+				// Satellite is below horizon
+				if findingAOS {
+					time1 = middleTime
+				} else {
+					time2 = middleTime
+				}
+			}
+
+			// Check if times are within 1 second
+			if time2.Sub(time1).Seconds() < 1.0 {
+				running = false
+				// Truncate to whole seconds
+				middleTime = time.Date(
+					middleTime.Year(), middleTime.Month(), middleTime.Day(),
+					middleTime.Hour(), middleTime.Minute(), middleTime.Second(),
+					0, middleTime.Location(),
+				)
+				// Step back/forward 1 second into the pass
+				if findingAOS {
+					middleTime = middleTime.Add(time.Second)
+				} else {
+					middleTime = middleTime.Add(-time.Second)
+				}
+			}
+		}
+
+		// Final refinement: step back/forward until just below horizon
+		running = true
+		cnt = 0
+		for running && cnt < 6 {
+			cnt++
+			elevation, err := getElevationAtTime(middleTime)
+			if err != nil {
+				break
+			}
+
+			if elevation > 0.0 {
+				if findingAOS {
+					middleTime = middleTime.Add(-time.Second)
+				} else {
+					middleTime = middleTime.Add(time.Second)
+				}
+			} else {
+				running = false
+			}
+		}
+
+		return middleTime, nil
+	}
+
+	// findMaxElevation finds the maximum elevation between aos and los times.
+	findMaxElevation := func(aos, los time.Time) (maxEl float64, maxElTime time.Time, err error) {
+		maxEl = -999999.9
+		maxElTime = aos
+
+		timeStep := los.Sub(aos) / 9 // Initial coarse step
+		currentTime := aos
+
+		for {
+			running := true
+			newMaxEl := -999999.9
+			newMaxElTime := aos
+
+			// Scan with current step size
+			for running && currentTime.Before(los) {
+				elevation, err := getElevationAtTime(currentTime)
+				if err != nil {
+					return maxEl, maxElTime, err
+				}
+
+				if elevation > newMaxEl {
+					newMaxEl = elevation
+					newMaxElTime = currentTime
+					// Move to next step
+					nextTime := currentTime.Add(timeStep)
+					if nextTime.After(los) {
+						nextTime = los
+					}
+					currentTime = nextTime
+				} else {
+					// Elevation is decreasing, stop this scan
+					running = false
+				}
+			}
+
+			// If max elevation didn't improve, we're done
+			if newMaxEl <= maxEl {
+				break
+			}
+
+			// Update best guess
+			maxEl = newMaxEl
+			maxElTime = newMaxElTime
+
+			// Refine search window and step size
+			time1 := currentTime.Add(-2 * timeStep) // Start 2 steps back
+			if time1.Before(aos) {
+				time1 = aos
+			}
+			time2 := currentTime // End at current time
+			if time2.After(los) {
+				time2 = los
+			}
+
+			currentTime = time1
+			timeStep = time2.Sub(time1) / 9
+
+			// Stop if step is less than 1 second
+			if timeStep < time.Second {
+				break
+			}
+		}
+
+		return maxEl, maxElTime, nil
+	}
+
+	// Main pass generation loop
+	currentTime := start
+	previousTime := start
+	foundAOS := false
+
+	for currentTime.Before(stop) {
+		endOfPass := false
+
+		// Get current elevation
+		elevation, err := getElevationAtTime(currentTime)
+		if err != nil {
+			// Skip this step on propagation error
+			previousTime = currentTime
+			currentTime = currentTime.Add(time.Duration(stepSeconds) * time.Second)
+			if currentTime.After(stop) {
+				currentTime = stop
+			}
 			continue
 		}
 
-		// Pass detection logic
-		isCurrentlyVisible := currentObservation.LookAngles.Elevation >= MinElevationForPass
-
-		if isCurrentlyVisible {
-			if currentPass == nil { // Start of a new pass (AOS)
-				currentPass = &PassDetails{
-					AOS:              currentTime,
-					AOSAzimuth:       currentObservation.LookAngles.Azimuth,
-					MaxElevation:     currentObservation.LookAngles.Elevation, // Initialize with first point
-					MaxElevationAz:   currentObservation.LookAngles.Azimuth,
-					MaxElevationTime: currentTime,
-					AOSObservation:   *currentObservation,
-					MaxElObservation: *currentObservation, // Set initial MaxElObservation
-					DataPoints:       []PassDataPoint{},   // Initialize the slice
-				}
-			}
-
-			// Add data point to the current pass
-			currentPass.DataPoints = append(currentPass.DataPoints, PassDataPoint{
-				Timestamp: currentTime,
-				Azimuth:   currentObservation.LookAngles.Azimuth,
-				Elevation: currentObservation.LookAngles.Elevation,
-				Range:     currentObservation.LookAngles.Range,
-				RangeRate: currentObservation.LookAngles.RangeRate,
-			})
-
-			// Update max elevation for the current pass
-			if currentObservation.LookAngles.Elevation > currentPass.MaxElevation {
-				currentPass.MaxElevation = currentObservation.LookAngles.Elevation
-				currentPass.MaxElevationAz = currentObservation.LookAngles.Azimuth
-				currentPass.MaxElevationTime = currentTime
-				currentPass.MaxElObservation = *currentObservation
-			}
-		} else { // Not currently visible
-			if currentPass != nil { // End of the current pass (LOS)
-				currentPass.LOS = currentTime
-				currentPass.LOSAzimuth = currentObservation.LookAngles.Azimuth
-
-				// Take LOS details from the last point that was visible (prevObservation) if available
-				// or the current one if it just dropped below the horizon
-				if prevObservation != nil && prevObservation.LookAngles.Elevation >= MinElevationForPass {
-					currentPass.LOS = prevObservation.SatellitePos.Timestamp // LOS is end of previous visible step
-					currentPass.LOSAzimuth = prevObservation.LookAngles.Azimuth
-					currentPass.LOSObservation = *prevObservation
+		if !foundAOS && elevation > 0.0 {
+			// Satellite has risen above horizon
+			var aosTime time.Time
+			if currentTime.Equal(start) {
+				// Already above horizon at start
+				aosTime = start
+			} else {
+				// Find exact AOS between previousTime and currentTime
+				aos, err := findCrossingPoint(previousTime, currentTime, true)
+				if err != nil {
+					// Fallback to current time if error
+					aosTime = currentTime
 				} else {
-					// Fallback: If somehow prevObservation isn't above horizon, use current (less ideal for LOS)
-					currentPass.LOSObservation = *currentObservation
+					aosTime = aos
 				}
-
-				currentPass.Duration = currentPass.LOS.Sub(currentPass.AOS)
-				passes = append(passes, *currentPass)
-				currentPass = nil // Reset for the next pass
 			}
+			foundAOS = true
+
+			// Initialize new pass
+			currentPass = &PassDetails{
+				AOS: aosTime,
+			}
+
+			// Get AOS observation details
+			tsinceAOS := aosTime.Sub(tle.EpochTime()).Minutes()
+			eciAOS, _ := tle.FindPosition(tsinceAOS) // Ignore error, we just got elevation
+			svAOS := &StateVector{X: eciAOS.Position.X, Y: eciAOS.Position.Y, Z: eciAOS.Position.Z}
+			aosObs, _ := svAOS.GetLookAngle(observer, aosTime)
+			currentPass.AOSAzimuth = aosObs.LookAngles.Azimuth
+			currentPass.AOSObservation = *aosObs
+		} else if foundAOS && elevation < 0.0 {
+			// Satellite has set below horizon
+			foundAOS = false
+			endOfPass = true
+
+			// Find exact LOS
+			los, err := findCrossingPoint(previousTime, currentTime, false)
+			if err != nil {
+				los = currentTime // Fallback
+			}
+
+			// Finalize the pass
+			currentPass.LOS = los
+
+			// Get LOS observation details
+			tsinceLOS := los.Sub(tle.EpochTime()).Minutes()
+			eciLOS, _ := tle.FindPosition(tsinceLOS)
+			svLOS := &StateVector{X: eciLOS.Position.X, Y: eciLOS.Position.Y, Z: eciLOS.Position.Z}
+			losObs, _ := svLOS.GetLookAngle(observer, los)
+			currentPass.LOSAzimuth = losObs.LookAngles.Azimuth
+			currentPass.LOSObservation = *losObs
+
+			// Find max elevation within the pass
+			maxEl, maxElTime, err := findMaxElevation(currentPass.AOS, currentPass.LOS)
+			if err == nil {
+				currentPass.MaxElevation = maxEl
+				currentPass.MaxElevationTime = maxElTime
+
+				// Get observation at max elevation
+				tsinceMax := maxElTime.Sub(tle.EpochTime()).Minutes()
+				eciMax, _ := tle.FindPosition(tsinceMax)
+				svMax := &StateVector{X: eciMax.Position.X, Y: eciMax.Position.Y, Z: eciMax.Position.Z}
+				maxElObs, _ := svMax.GetLookAngle(observer, maxElTime)
+				currentPass.MaxElevationAz = maxElObs.LookAngles.Azimuth
+				currentPass.MaxElObservation = *maxElObs
+			}
+
+			currentPass.Duration = currentPass.LOS.Sub(currentPass.AOS)
+			passes = append(passes, *currentPass)
+			currentPass = nil
 		}
 
-		prevObservation = currentObservation
-		currentTime = currentTime.Add(stepDuration)
+		// Update times
+		previousTime = currentTime
+		if endOfPass {
+			// Jump ahead after a pass to avoid unnecessary calculations
+			currentTime = currentTime.Add(30 * time.Minute)
+		} else {
+			currentTime = currentTime.Add(time.Duration(stepSeconds) * time.Second)
+		}
+
+		if currentTime.After(stop) {
+			currentTime = stop
+		}
 	}
 
-	// If the loop ends and a pass is still ongoing (satellite is visible at 'stop' time)
-	if currentPass != nil {
-		currentPass.LOS = stop      // Pass extends to the end of the window
-		if prevObservation != nil { // Use the last valid observation for LOS details
-			currentPass.LOSAzimuth = prevObservation.LookAngles.Azimuth
-			currentPass.LOSObservation = *prevObservation
+	// Handle case where satellite is still visible at end time
+	if foundAOS && currentPass != nil {
+		currentPass.LOS = stop
+
+		// Get LOS observation details (at stop time)
+		tsinceLOS := stop.Sub(tle.EpochTime()).Minutes()
+		eciLOS, _ := tle.FindPosition(tsinceLOS)
+		svLOS := &StateVector{X: eciLOS.Position.X, Y: eciLOS.Position.Y, Z: eciLOS.Position.Z}
+		losObs, _ := svLOS.GetLookAngle(observer, stop)
+		currentPass.LOSAzimuth = losObs.LookAngles.Azimuth
+		currentPass.LOSObservation = *losObs
+
+		// Find max elevation within the pass
+		maxEl, maxElTime, err := findMaxElevation(currentPass.AOS, currentPass.LOS)
+		if err == nil {
+			currentPass.MaxElevation = maxEl
+			currentPass.MaxElevationTime = maxElTime
+
+			// Get observation at max elevation
+			tsinceMax := maxElTime.Sub(tle.EpochTime()).Minutes()
+			eciMax, _ := tle.FindPosition(tsinceMax)
+			svMax := &StateVector{X: eciMax.Position.X, Y: eciMax.Position.Y, Z: eciMax.Position.Z}
+			maxElObs, _ := svMax.GetLookAngle(observer, maxElTime)
+			currentPass.MaxElevationAz = maxElObs.LookAngles.Azimuth
+			currentPass.MaxElObservation = *maxElObs
 		}
-		// No need for 'else if currentObservation != nil' here, as currentObservation is out of scope.
-		// If prevObservation is nil, it implies pass started and finished within a single step at stop time,
-		// and AOSObservation would hold the only point.
 
 		currentPass.Duration = currentPass.LOS.Sub(currentPass.AOS)
 		passes = append(passes, *currentPass)
@@ -486,4 +669,35 @@ func wrapLongitude(lon float64) float64 {
 		lon += twoPi
 	}
 	return lon
+}
+
+// AcTan calculates the arctangent in the correct quadrant based on sin and cos values.
+// It replicates the behavior of the C++ libsgp4 Util::AcTan function.
+func AcTan(sinx, cosx float64) float64 {
+	// Handle the case where cosx is effectively zero to avoid division by zero
+	// and determine the correct quadrant based on the sign of sinx.
+	if math.Abs(cosx) < 1e-14 { // Using a small epsilon, similar to other checks
+		if sinx > 0.0 {
+			return math.Pi / 2.0
+		} else {
+			// Note: C++ returns 3*PI/2. This is equivalent to -PI/2 in terms of angle,
+			// but let's stick exactly to the C++ logic for maximum fidelity.
+			// If the downstream code expects [-PI, PI] range, you might consider
+			// returning -math.Pi / 2.0 instead, but C++ uses [0, 2*PI).
+			return 3.0 * math.Pi / 2.0
+		}
+	} else {
+		// If cosx is positive, the angle is in quadrants I or IV.
+		// math.Atan will return the correct angle in [-PI/2, PI/2].
+		if cosx > 0.0 {
+			return math.Atan(sinx / cosx)
+		} else {
+			// If cosx is negative, the angle is in quadrants II or III.
+			// math.Atan will return an angle in [-PI/2, PI/2], but the actual
+			// angle is in [PI/2, 3*PI/2]. Adding PI corrects the quadrant.
+			// This also correctly handles the case where sinx is zero and cosx is negative
+			// (angle is PI).
+			return math.Pi + math.Atan(sinx/cosx) // Adding PI shifts to correct quadrant
+		}
+	}
 }
