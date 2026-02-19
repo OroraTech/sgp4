@@ -1,3 +1,3 @@
-module github.com/akhenakh/sgp4
+module github.com/OroraTech/sgp4
 
-go 1.23.4
+go 1.25.6
