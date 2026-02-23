@@ -321,13 +321,14 @@ func (tle *TLE) FindPositionAtTime(t time.Time) (Eci, error) {
 // lat, lng are observer's geodetic latitude/longitude in degrees.
 // alt is observer's altitude in meters above sea level.
 // start, stop are the time window boundaries.
-// stepSeconds is the time step for propagation in seconds.
-func (tle *TLE) GeneratePasses(obsLat, obsLng, obsAltMeters float64, start, stop time.Time, stepSeconds int) ([]PassDetails, error) {
+// step is the time step for propagation.
+func (tle *TLE) GeneratePasses(obsLat, obsLng, obsAltMeters float64, start, stop time.Time, step time.Duration) ([]PassDetails, error) {
 	if start.After(stop) {
 		return nil, fmt.Errorf("start time must be before stop time")
 	}
-	if stepSeconds <= 0 {
-		return nil, fmt.Errorf("stepSeconds must be positive")
+
+	if step <= 0 {
+		return nil, fmt.Errorf("step duration must be positive")
 	}
 
 	observer := &Location{
@@ -337,7 +338,6 @@ func (tle *TLE) GeneratePasses(obsLat, obsLng, obsAltMeters float64, start, stop
 	}
 
 	var passes []PassDetails
-	var currentPass *PassDetails
 
 	// Create a wrapper function to get elevation for binary search
 	getElevationAtTime := func(t time.Time) (float64, error) {
@@ -360,73 +360,43 @@ func (tle *TLE) GeneratePasses(obsLat, obsLng, obsAltMeters float64, start, stop
 	// findCrossingPoint finds the exact second the satellite crosses the horizon (0° elevation)
 	// between time1 and time2. `findingAOS` should be true for AOS, false for LOS.
 	findCrossingPoint := func(time1, time2 time.Time, findingAOS bool) (time.Time, error) {
-		running := true
-		cnt := 0
-		middleTime := time1
+		var middleTime time.Time
+		var err error
+		newElevation := math.MaxFloat64
 
-		// Binary search for crossing point
-		for running && cnt < 16 { // Limit iterations
-			cnt++
-			duration := time2.Sub(time1)
-			middleTime = time1.Add(duration / 2)
+		/*
+		 * loop until we zeroed in on the root below a second time diff
+		 */
+		for time2.Sub(time1).Seconds() > 1.0 {
+			middleTime = time1.Add(time.Second * time.Duration(time2.Sub(time1).Seconds()/2.0))
 
-			elevation, err := getElevationAtTime(middleTime)
+			/*
+			 * calculate elevation at time
+			 */
+			newElevation, err = getElevationAtTime(middleTime)
 			if err != nil {
-				return time1, err // Return start time on error
+				return time.Time{}, err
 			}
-
-			if elevation > 0.0 {
-				// Satellite is above horizon
-				if findingAOS {
-					time2 = middleTime
-				} else {
-					time1 = middleTime
-				}
+			if (newElevation > 0.0) == findingAOS {
+				time2 = middleTime
 			} else {
-				// Satellite is below horizon
-				if findingAOS {
-					time1 = middleTime
-				} else {
-					time2 = middleTime
-				}
-			}
-
-			// Check if times are within 1 second
-			if time2.Sub(time1).Seconds() < 1.0 {
-				running = false
-				// Truncate to whole seconds
-				middleTime = time.Date(
-					middleTime.Year(), middleTime.Month(), middleTime.Day(),
-					middleTime.Hour(), middleTime.Minute(), middleTime.Second(),
-					0, middleTime.Location(),
-				)
-				// Step back/forward 1 second into the pass
-				if findingAOS {
-					middleTime = middleTime.Add(time.Second)
-				} else {
-					middleTime = middleTime.Add(-time.Second)
-				}
+				time1 = middleTime
 			}
 		}
 
-		// Final refinement: step back/forward until just below horizon
-		running = true
-		cnt = 0
-		for running && cnt < 6 {
-			cnt++
-			elevation, err := getElevationAtTime(middleTime)
-			if err != nil {
-				break
-			}
-
-			if elevation > 0.0 {
+		/*
+		 * go back/forward 1second until below the horizon
+		 */
+		for newElevation > 0 {
+			middleTime = middleTime.Add(time.Second * time.Duration(func() int {
 				if findingAOS {
-					middleTime = middleTime.Add(-time.Second)
-				} else {
-					middleTime = middleTime.Add(time.Second)
+					return -1
 				}
-			} else {
-				running = false
+				return 1
+			}()))
+			newElevation, err = getElevationAtTime(middleTime)
+			if err != nil {
+				return time.Time{}, err
 			}
 		}
 
@@ -435,205 +405,159 @@ func (tle *TLE) GeneratePasses(obsLat, obsLng, obsAltMeters float64, start, stop
 
 	// findMaxElevation finds the maximum elevation between aos and los times.
 	findMaxElevation := func(aos, los time.Time) (maxEl float64, maxElTime time.Time, err error) {
-		maxEl = -999999.9
-		maxElTime = aos
+		timeStep := (los.Sub(aos).Seconds()) / 9.0
+		currentTime := aos       //! current time
+		endTime := los           //! end time of search period
+		var maxElevation float64 //! max elevation
+		var maxElevationTime time.Time
 
-		timeStep := los.Sub(aos) / 9 // Initial coarse step
-		currentTime := aos
+		for timeStep > 1.0 {
+			maxElevation = -math.MaxFloat64
 
-		for {
-			running := true
-			newMaxEl := -999999.9
-			newMaxElTime := aos
-
-			// Scan with current step size
-			for running && currentTime.Before(los) {
-				elevation, err := getElevationAtTime(currentTime)
+			for currentTime.Before(endTime) {
+				/*
+				 * calculate elevation at time
+				 */
+				newElevation, err := getElevationAtTime(currentTime)
 				if err != nil {
-					return maxEl, maxElTime, err
+					return math.NaN(), time.Time{}, err
 				}
-
-				if elevation > newMaxEl {
-					newMaxEl = elevation
-					newMaxElTime = currentTime
-					// Move to next step
-					nextTime := currentTime.Add(timeStep)
-					if nextTime.After(los) {
-						nextTime = los
+				if newElevation > maxElevation {
+					/*
+					 * still going up
+					 */
+					maxElevation = newElevation
+					maxElevationTime = currentTime
+					/*
+					 * move time along
+					 */
+					currentTime = currentTime.Add(time.Second * time.Duration(timeStep))
+					if currentTime.After(endTime) {
+						/*
+						 * dont go past end time
+						 */
+						currentTime = endTime
 					}
-					currentTime = nextTime
 				} else {
-					// Elevation is decreasing, stop this scan
-					running = false
+					/*
+					 * stop
+					 */
+					break
 				}
 			}
-
-			// If max elevation didn't improve, we're done
-			if newMaxEl <= maxEl {
-				break
-			}
-
-			// Update best guess
-			maxEl = newMaxEl
-			maxElTime = newMaxElTime
-
-			// Refine search window and step size
-			time1 := currentTime.Add(-2 * timeStep) // Start 2 steps back
-			if time1.Before(aos) {
-				time1 = aos
-			}
-			time2 := currentTime // End at current time
-			if time2.After(los) {
-				time2 = los
-			}
-
-			currentTime = time1
-			timeStep = time2.Sub(time1) / 9
-
-			// Stop if step is less than 1 second
-			if timeStep < time.Second {
-				break
-			}
+			/*
+			 * make end time to current time
+			 */
+			endTime = currentTime
+			/*
+			 * make current time of search period to 2 time steps back
+			 */
+			currentTime = currentTime.Add(time.Second * time.Duration(-2.0*timeStep))
+			/*
+			 * recalculate time step
+			 */
+			timeStep = (endTime.Sub(currentTime).Seconds()) / 9.0
 		}
-
-		return maxEl, maxElTime, nil
+		return maxElevation, maxElevationTime, nil
 	}
 
 	// Main pass generation loop
-	currentTime := start
-	previousTime := start
-	foundAOS := false
+	isGeostationary := tle.IsGeostationary()
+	currentTime := start.Round(time.Second) // Round to nearest second for cleaner pass times
+	currentElev, err := getElevationAtTime(currentTime)
+	if err != nil {
+		return nil, fmt.Errorf("error getting initial elevation: %w", err)
+	}
+	foundAos := false
+	foundLos := false
+	var aosTime time.Time
 
-	for currentTime.Before(stop) {
-		endOfPass := false
-
-		// Get current elevation
-		elevation, err := getElevationAtTime(currentTime)
-		if err != nil {
-			// Skip this step on propagation error
-			previousTime = currentTime
-			currentTime = currentTime.Add(time.Duration(stepSeconds) * time.Second)
-			if currentTime.After(stop) {
-				currentTime = stop
-			}
-			continue
-		}
-
-		if !foundAOS && elevation > 0.0 {
-			// Satellite has risen above horizon
-			var aosTime time.Time
-			if currentTime.Equal(start) {
-				// Already above horizon at start
-				aosTime = start
-			} else {
-				// Find exact AOS between previousTime and currentTime
-				aos, err := findCrossingPoint(previousTime, currentTime, true)
-				if err != nil {
-					// Fallback to current time if error
-					aosTime = currentTime
-				} else {
-					aosTime = aos
-				}
-			}
-			foundAOS = true
-
-			// Initialize new pass
-			currentPass = &PassDetails{
-				AOS: aosTime,
-			}
-
-			// Get AOS observation details
-			tsinceAOS := aosTime.Sub(tle.EpochTime()).Minutes()
-			eciAOS, _ := tle.FindPosition(tsinceAOS) // Ignore error, we just got elevation
-			svAOS := &StateVector{X: eciAOS.Position.X, Y: eciAOS.Position.Y, Z: eciAOS.Position.Z}
-			aosObs, _ := svAOS.GetLookAngle(observer, aosTime)
-			currentPass.AOSAzimuth = aosObs.LookAngles.Azimuth
-			currentPass.AOSObservation = *aosObs
-		} else if foundAOS && elevation < 0.0 {
-			// Satellite has set below horizon
-			foundAOS = false
-			endOfPass = true
-
-			// Find exact LOS
-			los, err := findCrossingPoint(previousTime, currentTime, false)
+	if !isGeostationary {
+		for currentElev >= 0.0 {
+			currentElev, err = getElevationAtTime(currentTime)
 			if err != nil {
-				los = currentTime // Fallback
+				break // Stop if we encounter an error during propagation
 			}
-
-			// Finalize the pass
-			currentPass.LOS = los
-
-			// Get LOS observation details
-			tsinceLOS := los.Sub(tle.EpochTime()).Minutes()
-			eciLOS, _ := tle.FindPosition(tsinceLOS)
-			svLOS := &StateVector{X: eciLOS.Position.X, Y: eciLOS.Position.Y, Z: eciLOS.Position.Z}
-			losObs, _ := svLOS.GetLookAngle(observer, los)
-			currentPass.LOSAzimuth = losObs.LookAngles.Azimuth
-			currentPass.LOSObservation = *losObs
-
-			// Find max elevation within the pass
-			maxEl, maxElTime, err := findMaxElevation(currentPass.AOS, currentPass.LOS)
-			if err == nil {
-				currentPass.MaxElevation = maxEl
-				currentPass.MaxElevationTime = maxElTime
-
-				// Get observation at max elevation
-				tsinceMax := maxElTime.Sub(tle.EpochTime()).Minutes()
-				eciMax, _ := tle.FindPosition(tsinceMax)
-				svMax := &StateVector{X: eciMax.Position.X, Y: eciMax.Position.Y, Z: eciMax.Position.Z}
-				maxElObs, _ := svMax.GetLookAngle(observer, maxElTime)
-				currentPass.MaxElevationAz = maxElObs.LookAngles.Azimuth
-				currentPass.MaxElObservation = *maxElObs
-			}
-
-			currentPass.Duration = currentPass.LOS.Sub(currentPass.AOS)
-			passes = append(passes, *currentPass)
-			currentPass = nil
+			currentTime = currentTime.Add(step * -1) // Step backwards in time
 		}
-
-		// Update times
-		previousTime = currentTime
-		if endOfPass {
-			// Jump ahead after a pass to avoid unnecessary calculations
-			currentTime = currentTime.Add(30 * time.Minute)
-		} else {
-			currentTime = currentTime.Add(time.Duration(stepSeconds) * time.Second)
-		}
-
-		if currentTime.After(stop) {
-			currentTime = stop
-		}
+	} else if currentElev > 0.0 {
+		foundAos = true
+		aosTime = currentTime
 	}
 
-	// Handle case where satellite is still visible at end time
-	if foundAOS && currentPass != nil {
-		currentPass.LOS = stop
+	for currentTime.Before(stop) || foundAos {
+		var losTime time.Time
+		nextTime := currentTime.Add(step)
+		/*
+		 * calculate next elevation
+		 */
+		nextElev, err := getElevationAtTime(nextTime)
+		if err != nil {
+			return passes, err
+		}
+		if currentElev < 0.0 && nextElev >= 0.0 {
+			/*
+			 * find the point at which the satellite crossed the horizon
+			 */
+			aosTime, err = findCrossingPoint(currentTime, nextTime, true)
+			if err == nil {
+				foundAos = true
+			}
+		} else if isGeostationary && !stop.Before(nextTime) && foundAos {
+			/*
+			 * For geostationary satellites, if we are still within the time window and have found an AOS,
+			 * we can assume LOS is at the end of the time window since they won't set.
+			 */
+			losTime = stop
+			foundLos = true
+		} else if currentElev > 0.0 && nextElev <= 0.0 && foundAos {
+			/*
+			 * already have the aos, but now the satellite is below the horizon,
+			 * so find the los
+			 */
+			losTime, err = findCrossingPoint(currentTime, nextTime, false)
+			if err == nil {
+				foundLos = true
+			} else {
+				foundAos = false // Reset AOS if we fail to find LOS, to avoid creating a pass with only AOS
+			}
+		}
+		if foundAos && foundLos {
+			maxElevation, maxElevationTime, _ := findMaxElevation(aosTime, losTime)
+			eciAOS, _ := tle.FindPosition(aosTime.Sub(tle.EpochTime()).Minutes())
+			svAOS := &StateVector{X: eciAOS.Position.X, Y: eciAOS.Position.Y, Z: eciAOS.Position.Z}
+			aosObs, _ := svAOS.GetLookAngle(observer, aosTime)
 
-		// Get LOS observation details (at stop time)
-		tsinceLOS := stop.Sub(tle.EpochTime()).Minutes()
-		eciLOS, _ := tle.FindPosition(tsinceLOS)
-		svLOS := &StateVector{X: eciLOS.Position.X, Y: eciLOS.Position.Y, Z: eciLOS.Position.Z}
-		losObs, _ := svLOS.GetLookAngle(observer, stop)
-		currentPass.LOSAzimuth = losObs.LookAngles.Azimuth
-		currentPass.LOSObservation = *losObs
-
-		// Find max elevation within the pass
-		maxEl, maxElTime, err := findMaxElevation(currentPass.AOS, currentPass.LOS)
-		if err == nil {
-			currentPass.MaxElevation = maxEl
-			currentPass.MaxElevationTime = maxElTime
-
-			// Get observation at max elevation
-			tsinceMax := maxElTime.Sub(tle.EpochTime()).Minutes()
-			eciMax, _ := tle.FindPosition(tsinceMax)
+			eciMax, _ := tle.FindPosition(maxElevationTime.Sub(tle.EpochTime()).Minutes())
 			svMax := &StateVector{X: eciMax.Position.X, Y: eciMax.Position.Y, Z: eciMax.Position.Z}
-			maxElObs, _ := svMax.GetLookAngle(observer, maxElTime)
-			currentPass.MaxElevationAz = maxElObs.LookAngles.Azimuth
-			currentPass.MaxElObservation = *maxElObs
+			maxElObs, _ := svMax.GetLookAngle(observer, maxElevationTime)
+
+			eciLOS, _ := tle.FindPosition(losTime.Sub(tle.EpochTime()).Minutes())
+			svLOS := &StateVector{X: eciLOS.Position.X, Y: eciLOS.Position.Y, Z: eciLOS.Position.Z}
+			losObs, _ := svLOS.GetLookAngle(observer, losTime)
+
+			pd := PassDetails{
+				AOS:              aosTime,
+				LOS:              losTime,
+				AOSAzimuth:       aosObs.LookAngles.Azimuth,
+				LOSAzimuth:       losObs.LookAngles.Azimuth,
+				MaxElevation:     maxElevation,
+				MaxElevationAz:   maxElObs.LookAngles.Azimuth,
+				MaxElevationTime: maxElevationTime,
+				AOSObservation:   *aosObs,
+				LOSObservation:   *losObs,
+				MaxElObservation: *maxElObs,
+				Duration:         losTime.Sub(aosTime),
+			}
+
+			passes = append(passes, pd)
+			foundAos = false
+			foundLos = false
+			nextTime = losTime.Add(time.Duration(30) * time.Minute) // Skip 30 minutes
 		}
 
-		currentPass.Duration = currentPass.LOS.Sub(currentPass.AOS)
-		passes = append(passes, *currentPass)
+		currentTime = nextTime
+		currentElev = nextElev
 	}
 
 	return passes, nil

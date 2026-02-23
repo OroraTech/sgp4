@@ -6,7 +6,7 @@ import (
 	"os"
 	"time"
 
-	"github.com/akhenakh/sgp4"
+	"github.com/OroraTech/sgp4"
 )
 
 func main() {
@@ -25,9 +25,9 @@ func main() {
 
 	startTime := time.Now().UTC().Add(48 * time.Hour)
 	stopTime := startTime.Add(48 * time.Hour) // Predict for the next 24 hours
-	stepSeconds := 10                         // Propagation step in seconds
+	stepSeconds := 100                        // Propagation step in seconds
 
-	passes, err := tle.GeneratePasses(observerLat, observerLng, observerAltM, startTime, stopTime, stepSeconds)
+	passes, err := tle.GeneratePasses(observerLat, observerLng, observerAltM, startTime, stopTime, time.Duration(stepSeconds)*time.Second)
 	if err != nil {
 		log.Fatalf("Error generating passes: %v", err)
 	}
