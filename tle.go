@@ -99,7 +99,7 @@ func ParseTLE(input string) (*TLE, error) {
 		return nil, fmt.Errorf("error parsing line 2: %w", err)
 	}
 
-	calculatedCheckSum1, err := calculateChecksum(line1)
+	calculatedCheckSum1, err := CalculateChecksum(line1)
 	if err != nil {
 		return nil, fmt.Errorf("checksum calculation failed for line 1: %w", err)
 	}
@@ -107,7 +107,7 @@ func ParseTLE(input string) (*TLE, error) {
 		return nil, fmt.Errorf("checksum mismatch in line 1: expected %d (from TLE), got %d (calculated)", tle.CheckSum1, calculatedCheckSum1)
 	}
 
-	calculatedCheckSum2, err := calculateChecksum(line2)
+	calculatedCheckSum2, err := CalculateChecksum(line2)
 	if err != nil {
 		return nil, fmt.Errorf("checksum calculation failed for line 2: %w", err)
 	}
@@ -381,10 +381,10 @@ func RecomputeConstants(xinc float64) (sinio, cosio, x3thm1, x1mth2, x7thm1, xlc
 	return
 }
 
-// calculateChecksum calculates the modulo-10 checksum for a TLE line.
+// CalculateChecksum calculates the modulo-10 checksum for a TLE line.
 // It sums all numerical digits, with '-' counting as 1. Other characters are ignored.
 // The checksum is calculated for the first 68 characters of the line.
-func calculateChecksum(line string) (int, error) {
+func CalculateChecksum(line string) (int, error) {
 	if len(line) != 69 {
 		return 0, fmt.Errorf("line must be 69 characters long, got %d", len(line))
 	}

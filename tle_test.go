@@ -18,7 +18,7 @@ func TestParseTLE(t *testing.T) {
 	tle, err := ParseTLE(issTLE)
 	if err != nil {
 		// If the checksum for Line 2 is indeed '3' in the TLE and our standard calculation gives '2',
-		// this ParseTLE will fail here if the fixed calculateChecksum is used.
+		// this ParseTLE will fail here if the fixed CalculateChecksum is used.
 		// This is the behavior indicated by "TestParseTLE is failing because of the checksum not passing".
 		// The test setup itself will cause a failure if tle.CheckSum2 (3) != calculated (2).
 		t.Fatalf("Failed to parse ISS TLE: %v", err)
@@ -168,13 +168,13 @@ func TestInvalidTLE(t *testing.T) {
 			if strings.Contains(testTLE, "Checksum1") {
 				l1 := strings.Split(testTLE, "\n")[0]
 				l1 = l1[:68]
-				c1, _ := calculateChecksum(l1 + "0")
+				c1, _ := CalculateChecksum(l1 + "0")
 				testTLE = strings.Replace(testTLE, "Checksum1", strconv.Itoa(c1), 1)
 			}
 			if strings.Contains(testTLE, "Checksum2") {
 				l2 := strings.Split(testTLE, "\n")[1]
 				l2 = l2[:68]
-				c2, _ := calculateChecksum(l2 + "0")
+				c2, _ := CalculateChecksum(l2 + "0")
 				testTLE = strings.Replace(testTLE, "Checksum2", strconv.Itoa(c2), 1)
 			}
 
