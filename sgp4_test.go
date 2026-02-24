@@ -351,7 +351,7 @@ func TestGeneratePasses_Reference(t *testing.T) {
 
 	// Run the pass prediction. A coarse step of 60 seconds is a good balance.
 	const stepSeconds = 60
-	predictedPasses, err := tle.GeneratePasses(obsLat, obsLon, obsAltMeters, startTime, stopTime, stepSeconds)
+	predictedPasses, err := tle.GeneratePasses(obsLat, obsLon, obsAltMeters, startTime, stopTime, time.Duration(stepSeconds)*time.Second)
 	if err != nil {
 		t.Fatalf("GeneratePasses failed: %v", err)
 	}

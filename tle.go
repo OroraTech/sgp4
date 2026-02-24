@@ -124,7 +124,7 @@ func (tle *TLE) parseLine1(line string) error {
 	}
 
 	var err error
-	tle.SatelliteNumber, err = strconv.Atoi(strings.TrimSpace(line[2:7]))
+	tle.SatelliteNumber, err = parseNoradId(strings.TrimSpace(line[2:7]))
 	if err != nil {
 		return fmt.Errorf("invalid satellite number: %w", err)
 	}
@@ -219,7 +219,7 @@ func (tle *TLE) parseLine2(line string) error {
 	}
 
 	var err error
-	satNum, err := strconv.Atoi(strings.TrimSpace(line[2:7]))
+	satNum, err := parseNoradId(strings.TrimSpace(line[2:7]))
 	if err != nil {
 		return fmt.Errorf("invalid satellite number in line 2: %w", err)
 	}
@@ -399,4 +399,41 @@ func calculateChecksum(line string) (int, error) {
 		// All other characters (letters, space, '.', '+') are ignored.
 	}
 	return sum % 10, nil
+}
+
+func parseNoradId(s string) (int, error) {
+	charMap := map[rune]string{
+		'A': "10",
+		'B': "11",
+		'C': "12",
+		'D': "13",
+		'E': "14",
+		'F': "15",
+		'G': "16",
+		'H': "17",
+		'J': "18",
+		'K': "19",
+		'L': "20",
+		'M': "21",
+		'N': "22",
+		'P': "23",
+		'Q': "24",
+		'R': "25",
+		'S': "26",
+		'T': "27",
+		'U': "28",
+		'V': "29",
+		'W': "30",
+		'X': "31",
+		'Y': "32",
+		'Z': "33",
+	}
+	if char, exists := charMap[rune(s[0])]; exists {
+		s = char + s[1:]
+	}
+	noradId, err := strconv.Atoi(s)
+	if err != nil {
+		return 0, err
+	}
+	return noradId, nil
 }

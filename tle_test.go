@@ -68,6 +68,19 @@ func TestParseTLE(t *testing.T) {
 	}
 }
 
+func TestParseAlpha5TLE(t *testing.T) {
+	issTLE := `ISS (ZARYA)
+1 D5544U 98067A   08264.51782528 -.00002182  00000-0 -11606-4 0  2925
+2 D5544  51.6416 247.4627 0006703 130.5360 325.0288 15.72125391563535`
+	tle, err := ParseTLE(issTLE)
+	if err != nil {
+		t.Fatalf("Failed to parse ISS TLE: %v", err)
+	}
+	if tle.SatelliteNumber != 135544 {
+		t.Errorf("SatelliteNumber = %d, want 135544", tle.SatelliteNumber)
+	}
+}
+
 func compareExact(got, want interface{}, _ float64) bool {
 	return got == want
 }
