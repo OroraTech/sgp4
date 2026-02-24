@@ -79,6 +79,13 @@ func TestParseAlpha5TLE(t *testing.T) {
 	if tle.SatelliteNumber != 135544 {
 		t.Errorf("SatelliteNumber = %d, want 135544", tle.SatelliteNumber)
 	}
+	noradId, err := tle.NoradIDString()
+	if err != nil {
+		t.Fatalf("Failed to get NoradIDString: %v", err)
+	}
+	if noradId != "D5544" {
+		t.Errorf("NoradIDString() = %s, want D5544", noradId)
+	}
 }
 
 func compareExact(got, want interface{}, _ float64) bool {

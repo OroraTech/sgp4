@@ -332,6 +332,17 @@ func (tle *TLE) IsGeostationary() bool {
 	return true
 }
 
+func (tle *TLE) NoradIDString() (string, error) {
+	lookup := "0123456789ABCDEFGHJKMNPQRSTUVWXZ" // Index corresponds to leading digits (0-33)
+	noradId := tle.SatelliteNumber
+	if noradId < 0 || noradId > 339999 {
+		return "", fmt.Errorf("invalid satellite number: %d", noradId)
+	}
+	prefix := noradId / 10000
+	noradId = noradId % 10000 // Get the last 4 digits
+	return fmt.Sprintf("%c%04d", lookup[prefix], noradId), nil
+}
+
 // SGP4Constants holds values used in SGP4 orbital calculations
 type SGP4Constants struct {
 	Sinio  float64 // Sine of inclination
