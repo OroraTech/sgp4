@@ -391,3 +391,31 @@ func TestGeneratePasses_Reference(t *testing.T) {
 		})
 	}
 }
+
+func TestFindPositionAtTime_SubMinuteResolution(t *testing.T) {
+	tle, err := ParseTLE("ISS (ZARYA)\n1 25544U 98067A   26144.84170369  .00008909  00000+0  16754-3 0  9996\n2 25544  51.6327  55.6720 0007493  94.5162 265.6683 15.49354393568136")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	ti := time.Now()
+
+	eci1, err := tle.FindPositionAtTime(ti)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	eci2, err := tle.FindPositionAtTime(ti.Add(30 * time.Second))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if eci1.DateTime.Equal(eci2.DateTime) {
+		t.Fatalf("DateTime should differ for inputs 30s apart, but both are %v", eci1.DateTime)
+	}
+
+	expectedDiff := eci2.DateTime.Sub(eci1.DateTime)
+	if expectedDiff < 29*time.Second || expectedDiff > 31*time.Second {
+		t.Errorf("expected ~30s difference between DateTimes, got %v", expectedDiff)
+	}
+}
