@@ -148,6 +148,10 @@ for i, pass := range passes {
 }
 ```
 
+## Use This Package
+
+- This is the reason for this package, I was maintaining an iOS (ObjC) app called [SatSaT](https://satsat.inair.space/) but cost was too high, so I created a [web app](https://websat.inair.space/) with the same ideas.
+
 ## License
 
 Apache 2.0
