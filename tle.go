@@ -22,6 +22,8 @@ type TLE struct {
 	MeanMotionDot   float64
 	MeanMotionDot2  float64
 	Bstar           float64
+	BstarMantissa   float64 // Mantissa of B* with the decimal point resolved (intermediate parse value)
+	BstarExponent   int     // Exponent of B* as parsed from TLE (intermediate parse value)
 	ElementNumber   int
 	CheckSum1       int
 
@@ -61,6 +63,12 @@ func (tle *TLE) EpochTime() time.Time {
 // It accepts either a two-line or three-line format (with satellite name).
 func ParseTLE(input string) (*TLE, error) {
 	lines := strings.Split(strings.TrimSpace(input), "\n")
+	return ParseTLELines(lines)
+}
+
+// ParseTLELines is the same as ParseTLE except its argument is a two-line element set
+// already split into individual lines.
+func ParseTLELines(lines []string) (*TLE, error) {
 	for i, line := range lines { // Trim spaces from each line, useful if input has trailing spaces per line
 		lines[i] = strings.TrimSpace(line)
 	}
@@ -194,7 +202,10 @@ func (tle *TLE) parseLine1(line string) error {
 	if err != nil {
 		return fmt.Errorf("invalid B* exponent ('%s'): %w", bstarExponentStr, err)
 	}
-	tle.Bstar = bstarMantissa * 1e-5 * math.Pow(10, float64(bstarExponent))
+	resolvedMantissa := bstarMantissa * 1e-5
+	tle.Bstar = resolvedMantissa * math.Pow(10, float64(bstarExponent))
+	tle.BstarMantissa = resolvedMantissa
+	tle.BstarExponent = int(bstarExponent)
 
 	// Element Set Type (usually 0) and Element Number
 	// Field 63 is Ephemeris Type, field 65-68 is Element Number.
