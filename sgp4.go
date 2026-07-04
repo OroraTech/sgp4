@@ -3,6 +3,7 @@ package sgp4
 import (
 	"fmt"
 	"math"
+	"slices"
 	"time"
 )
 
@@ -339,22 +340,25 @@ func (tle *TLE) GeneratePasses(obsLat, obsLng, obsAltMeters float64, start, stop
 
 	var passes []PassDetails
 
-	// Create a wrapper function to get elevation for binary search
-	getElevationAtTime := func(t time.Time) (float64, error) {
-		tsince := t.Sub(tle.EpochTime()).Minutes()
-		eciState, err := tle.FindPosition(tsince)
+	getLookAngleAtTime := func(t time.Time) (*Observation, error) {
+		eciState, err := tle.FindPositionAtTime(t)
 		if err != nil {
-			return 0.0, err
+			return nil, err
 		}
 		sv := &StateVector{
 			X: eciState.Position.X, Y: eciState.Position.Y, Z: eciState.Position.Z,
 			VX: eciState.Velocity.X, VY: eciState.Velocity.Y, VZ: eciState.Velocity.Z,
 		}
-		observation, err := sv.GetLookAngle(observer, t)
+		return sv.GetLookAngle(observer, t)
+	}
+
+	// Create a wrapper function to get elevation for binary search
+	getElevationAtTime := func(t time.Time) (float64, error) {
+		angle, err := getLookAngleAtTime(t)
 		if err != nil {
 			return 0.0, err
 		}
-		return observation.LookAngles.Elevation, nil
+		return angle.LookAngles.Elevation, nil
 	}
 
 	// findCrossingPoint finds the exact second the satellite crosses the horizon (0° elevation)
@@ -464,7 +468,7 @@ func (tle *TLE) GeneratePasses(obsLat, obsLng, obsAltMeters float64, start, stop
 	// Main pass generation loop
 	isGeostationary := tle.IsGeostationary()
 	currentTime := start.Round(time.Second) // Round to nearest second for cleaner pass times
-	currentElev, err := getElevationAtTime(currentTime)
+	currentObservation, err := getLookAngleAtTime(currentTime)
 	if err != nil {
 		return nil, fmt.Errorf("error getting initial elevation: %w", err)
 	}
@@ -473,29 +477,30 @@ func (tle *TLE) GeneratePasses(obsLat, obsLng, obsAltMeters float64, start, stop
 	var aosTime time.Time
 
 	if !isGeostationary {
-		for currentElev >= 0.0 {
-			currentElev, err = getElevationAtTime(currentTime)
+		for currentObservation.LookAngles.Elevation >= 0.0 {
+			currentObservation, err = getLookAngleAtTime(currentTime)
 			if err != nil {
 				break // Stop if we encounter an error during propagation
 			}
 			currentTime = currentTime.Add(step * -1) // Step backwards in time
 		}
-	} else if currentElev > 0.0 {
+	} else if currentObservation.LookAngles.Elevation > 0.0 {
 		foundAos = true
 		aosTime = currentTime
 	}
 
+	var passDataPoints []PassDataPoint
 	for currentTime.Before(stop) || foundAos {
 		var losTime time.Time
 		nextTime := currentTime.Add(step)
 		/*
 		 * calculate next elevation
 		 */
-		nextElev, err := getElevationAtTime(nextTime)
+		nextObservation, err := getLookAngleAtTime(nextTime)
 		if err != nil {
 			return passes, err
 		}
-		if currentElev < 0.0 && nextElev >= 0.0 {
+		if currentObservation.LookAngles.Elevation < 0.0 && nextObservation.LookAngles.Elevation >= 0.0 {
 			/*
 			 * find the point at which the satellite crossed the horizon
 			 */
@@ -510,7 +515,7 @@ func (tle *TLE) GeneratePasses(obsLat, obsLng, obsAltMeters float64, start, stop
 			 */
 			losTime = stop
 			foundLos = true
-		} else if currentElev > 0.0 && nextElev <= 0.0 && foundAos {
+		} else if currentObservation.LookAngles.Elevation > 0.0 && nextObservation.LookAngles.Elevation <= 0.0 && foundAos {
 			/*
 			 * already have the aos, but now the satellite is below the horizon,
 			 * so find the los
@@ -524,17 +529,18 @@ func (tle *TLE) GeneratePasses(obsLat, obsLng, obsAltMeters float64, start, stop
 		}
 		if foundAos && foundLos {
 			maxElevation, maxElevationTime, _ := findMaxElevation(aosTime, losTime)
-			eciAOS, _ := tle.FindPosition(aosTime.Sub(tle.EpochTime()).Minutes())
-			svAOS := &StateVector{X: eciAOS.Position.X, Y: eciAOS.Position.Y, Z: eciAOS.Position.Z}
-			aosObs, _ := svAOS.GetLookAngle(observer, aosTime)
+			aosObs, _ := getLookAngleAtTime(aosTime)
+			maxElObs, _ := getLookAngleAtTime(maxElevationTime)
+			losObs, _ := getLookAngleAtTime(losTime)
 
-			eciMax, _ := tle.FindPosition(maxElevationTime.Sub(tle.EpochTime()).Minutes())
-			svMax := &StateVector{X: eciMax.Position.X, Y: eciMax.Position.Y, Z: eciMax.Position.Z}
-			maxElObs, _ := svMax.GetLookAngle(observer, maxElevationTime)
-
-			eciLOS, _ := tle.FindPosition(losTime.Sub(tle.EpochTime()).Minutes())
-			svLOS := &StateVector{X: eciLOS.Position.X, Y: eciLOS.Position.Y, Z: eciLOS.Position.Z}
-			losObs, _ := svLOS.GetLookAngle(observer, losTime)
+			passDataPoints = append(passDataPoints,
+				passDataPointFromObservation(aosTime, aosObs),
+				passDataPointFromObservation(maxElevationTime, maxElObs),
+				passDataPointFromObservation(losTime, losObs),
+			)
+			slices.SortFunc(passDataPoints, func(a, b PassDataPoint) int {
+				return int(a.Timestamp.Sub(b.Timestamp).Seconds())
+			})
 
 			pd := PassDetails{
 				AOS:              aosTime,
@@ -548,19 +554,35 @@ func (tle *TLE) GeneratePasses(obsLat, obsLng, obsAltMeters float64, start, stop
 				LOSObservation:   *losObs,
 				MaxElObservation: *maxElObs,
 				Duration:         losTime.Sub(aosTime),
+				DataPoints:       passDataPoints,
 			}
 
 			passes = append(passes, pd)
 			foundAos = false
 			foundLos = false
+			passDataPoints = []PassDataPoint{}
 			nextTime = losTime.Add(time.Duration(30) * time.Minute) // Skip 30 minutes
 		}
 
 		currentTime = nextTime
-		currentElev = nextElev
+		currentObservation = nextObservation
+
+		if foundAos && !foundLos {
+			passDataPoints = append(passDataPoints, passDataPointFromObservation(currentTime, currentObservation))
+		}
 	}
 
 	return passes, nil
+}
+
+func passDataPointFromObservation(time time.Time, obs *Observation) PassDataPoint {
+	return PassDataPoint{
+		Timestamp: time,
+		Azimuth:   obs.LookAngles.Azimuth,
+		Elevation: obs.LookAngles.Elevation,
+		Range:     obs.LookAngles.Range,
+		RangeRate: obs.LookAngles.RangeRate,
+	}
 }
 
 func julianDateTime(t_utc time.Time) float64 {
