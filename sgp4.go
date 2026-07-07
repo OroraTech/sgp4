@@ -324,6 +324,16 @@ func (tle *TLE) FindPositionAtTime(t time.Time) (Eci, error) {
 // start, stop are the time window boundaries.
 // step is the time step for propagation.
 func (tle *TLE) GeneratePasses(obsLat, obsLng, obsAltMeters float64, start, stop time.Time, step time.Duration) ([]PassDetails, error) {
+	return tle.GeneratePassesWithHorizon(&Horizon{}, obsLat, obsLng, obsAltMeters, start, stop, step)
+}
+
+// GeneratePasses predicts satellite passes over a ground station within a given time window and with a specified horizon profile.
+// horizon defines the elevation angle threshold for AOS and LOS, allowing for custom horizon profiles (e.g., obstructions).
+// lat, lng are observer's geodetic latitude/longitude in degrees.
+// alt is observer's altitude in meters above sea level.
+// start, stop are the time window boundaries.
+// step is the time step for propagation.
+func (tle *TLE) GeneratePassesWithHorizon(horizon *Horizon, obsLat, obsLng, obsAltMeters float64, start, stop time.Time, step time.Duration) ([]PassDetails, error) {
 	if start.After(stop) {
 		return nil, fmt.Errorf("start time must be before stop time")
 	}
@@ -352,21 +362,12 @@ func (tle *TLE) GeneratePasses(obsLat, obsLng, obsAltMeters float64, start, stop
 		return sv.GetLookAngle(observer, t)
 	}
 
-	// Create a wrapper function to get elevation for binary search
-	getElevationAtTime := func(t time.Time) (float64, error) {
-		angle, err := getLookAngleAtTime(t)
-		if err != nil {
-			return 0.0, err
-		}
-		return angle.LookAngles.Elevation, nil
-	}
-
 	// findCrossingPoint finds the exact second the satellite crosses the horizon (0° elevation)
 	// between time1 and time2. `findingAOS` should be true for AOS, false for LOS.
-	findCrossingPoint := func(time1, time2 time.Time, findingAOS bool) (time.Time, error) {
+	findCrossingPoint := func(horizon *Horizon, time1, time2 time.Time, findingAOS bool) (time.Time, error) {
 		var middleTime time.Time
 		var err error
-		newElevation := math.MaxFloat64
+		var newObserverAngle *Observation
 
 		/*
 		 * loop until we zeroed in on the root below a second time diff
@@ -377,11 +378,11 @@ func (tle *TLE) GeneratePasses(obsLat, obsLng, obsAltMeters float64, start, stop
 			/*
 			 * calculate elevation at time
 			 */
-			newElevation, err = getElevationAtTime(middleTime)
+			newObserverAngle, err = getLookAngleAtTime(middleTime)
 			if err != nil {
 				return time.Time{}, err
 			}
-			if (newElevation > 0.0) == findingAOS {
+			if (newObserverAngle.LookAngles.Elevation > horizon.GetElevation(newObserverAngle.LookAngles.Azimuth)) == findingAOS {
 				time2 = middleTime
 			} else {
 				time1 = middleTime
@@ -391,14 +392,14 @@ func (tle *TLE) GeneratePasses(obsLat, obsLng, obsAltMeters float64, start, stop
 		/*
 		 * go back/forward 1second until below the horizon
 		 */
-		for newElevation > 0 {
+		for newObserverAngle.LookAngles.Elevation > horizon.GetElevation(newObserverAngle.LookAngles.Azimuth) {
 			middleTime = middleTime.Add(time.Second * time.Duration(func() int {
 				if findingAOS {
 					return -1
 				}
 				return 1
 			}()))
-			newElevation, err = getElevationAtTime(middleTime)
+			newObserverAngle, err = getLookAngleAtTime(middleTime)
 			if err != nil {
 				return time.Time{}, err
 			}
@@ -422,15 +423,15 @@ func (tle *TLE) GeneratePasses(obsLat, obsLng, obsAltMeters float64, start, stop
 				/*
 				 * calculate elevation at time
 				 */
-				newElevation, err := getElevationAtTime(currentTime)
+				angle, err := getLookAngleAtTime(currentTime)
 				if err != nil {
 					return math.NaN(), time.Time{}, err
 				}
-				if newElevation > maxElevation {
+				if angle.LookAngles.Elevation > maxElevation {
 					/*
 					 * still going up
 					 */
-					maxElevation = newElevation
+					maxElevation = angle.LookAngles.Elevation
 					maxElevationTime = currentTime
 					/*
 					 * move time along
@@ -477,14 +478,14 @@ func (tle *TLE) GeneratePasses(obsLat, obsLng, obsAltMeters float64, start, stop
 	var aosTime time.Time
 
 	if !isGeostationary {
-		for currentObservation.LookAngles.Elevation >= 0.0 {
+		for currentObservation.LookAngles.Elevation >= horizon.GetElevation(currentObservation.LookAngles.Azimuth) {
 			currentObservation, err = getLookAngleAtTime(currentTime)
 			if err != nil {
 				break // Stop if we encounter an error during propagation
 			}
 			currentTime = currentTime.Add(step * -1) // Step backwards in time
 		}
-	} else if currentObservation.LookAngles.Elevation > 0.0 {
+	} else if currentObservation.LookAngles.Elevation > horizon.GetElevation(currentObservation.LookAngles.Azimuth) {
 		foundAos = true
 		aosTime = currentTime
 	}
@@ -497,14 +498,16 @@ func (tle *TLE) GeneratePasses(obsLat, obsLng, obsAltMeters float64, start, stop
 		 * calculate next elevation
 		 */
 		nextObservation, err := getLookAngleAtTime(nextTime)
+		nextObservationElevationThreshold := horizon.GetElevation(nextObservation.LookAngles.Azimuth)
+		currentObservationElevationThreshold := horizon.GetElevation(currentObservation.LookAngles.Azimuth)
 		if err != nil {
 			return passes, err
 		}
-		if currentObservation.LookAngles.Elevation < 0.0 && nextObservation.LookAngles.Elevation >= 0.0 {
+		if currentObservation.LookAngles.Elevation < currentObservationElevationThreshold && nextObservation.LookAngles.Elevation >= nextObservationElevationThreshold {
 			/*
 			 * find the point at which the satellite crossed the horizon
 			 */
-			aosTime, err = findCrossingPoint(currentTime, nextTime, true)
+			aosTime, err = findCrossingPoint(horizon, currentTime, nextTime, true)
 			if err == nil {
 				foundAos = true
 			}
@@ -515,12 +518,12 @@ func (tle *TLE) GeneratePasses(obsLat, obsLng, obsAltMeters float64, start, stop
 			 */
 			losTime = stop
 			foundLos = true
-		} else if currentObservation.LookAngles.Elevation > 0.0 && nextObservation.LookAngles.Elevation <= 0.0 && foundAos {
+		} else if currentObservation.LookAngles.Elevation > currentObservationElevationThreshold && nextObservation.LookAngles.Elevation <= nextObservationElevationThreshold && foundAos {
 			/*
 			 * already have the aos, but now the satellite is below the horizon,
 			 * so find the los
 			 */
-			losTime, err = findCrossingPoint(currentTime, nextTime, false)
+			losTime, err = findCrossingPoint(horizon, currentTime, nextTime, false)
 			if err == nil {
 				foundLos = true
 			} else {
