@@ -132,7 +132,7 @@ func (tle *TLE) parseLine1(line string) error {
 	}
 
 	var err error
-	tle.SatelliteNumber, err = parseNoradId(strings.TrimSpace(line[2:7]))
+	tle.SatelliteNumber, err = ParseNoradId(strings.TrimSpace(line[2:7]))
 	if err != nil {
 		return fmt.Errorf("invalid satellite number: %w", err)
 	}
@@ -230,7 +230,7 @@ func (tle *TLE) parseLine2(line string) error {
 	}
 
 	var err error
-	satNum, err := parseNoradId(strings.TrimSpace(line[2:7]))
+	satNum, err := ParseNoradId(strings.TrimSpace(line[2:7]))
 	if err != nil {
 		return fmt.Errorf("invalid satellite number in line 2: %w", err)
 	}
@@ -423,7 +423,7 @@ func CalculateChecksum(line string) (int, error) {
 	return sum % 10, nil
 }
 
-func parseNoradId(s string) (int, error) {
+func ParseNoradId(s string) (int, error) {
 	charMap := map[rune]string{
 		'A': "10",
 		'B': "11",
