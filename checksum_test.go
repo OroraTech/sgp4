@@ -13,7 +13,7 @@ func TestChecksum(t *testing.T) {
 	}
 
 	for i, line := range lines {
-		computedChecksum, err := calculateChecksum(line)
+		computedChecksum, err := CalculateChecksum(line)
 		if err != nil {
 			t.Errorf("Error calculating checksum for line %d: %v", i+1, err)
 			continue
